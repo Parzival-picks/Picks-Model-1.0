@@ -1,6 +1,6 @@
 // pages/api/fixtures.js
-// Fetches today's fixtures and team stats from API-Football (RapidAPI)
-// Called by the frontend — keeps the API key server-side only
+// Usa la API: api-football186.p.rapidapi.com
+// Endpoints: competition_matches_list, matches/{id}/info, matches/{id}/statsv2
 
 const RAPIDAPI_KEY = process.env.RAPIDAPI_KEY;
 const RAPIDAPI_HOST = process.env.RAPIDAPI_HOST;
@@ -12,10 +12,9 @@ const headers = {
   "Content-Type": "application/json",
 };
 
-// World Cup 2026 league ID in API-Football
-// We also include friendly competitions as fallback
-const WC_LEAGUE_ID = 1; // FIFA World Cup
-const SEASON = 2026;
+function today() {
+  return new Date().toISOString().split("T")[0];
+}
 
 async function fetchJSON(url) {
   const res = await fetch(url, { headers });
@@ -23,70 +22,51 @@ async function fetchJSON(url) {
   return res.json();
 }
 
-// Get today's date in YYYY-MM-DD
-function today() {
-  return new Date().toISOString().split("T")[0];
-}
-
-// Fetch today's fixtures for a given league
-async function getTodayFixtures(leagueId) {
-  const url = `${BASE_URL}/fixtures?league=${leagueId}&season=${SEASON}&date=${today()}`;
+// GET /competition_matches_list?date=YYYY-MM-DD&timezone=America/Mexico_City
+async function getMatchesByDate(date) {
+  const url = `${BASE_URL}/competition_matches_list?date=${date}&timezone=America%2FMexico_City`;
   const data = await fetchJSON(url);
-  return data.response || [];
+  // La respuesta viene en data.response.items o data.items
+  return data?.response?.items || data?.items || [];
 }
 
-// Fetch team statistics for current season
-async function getTeamStats(teamId, leagueId) {
-  const url = `${BASE_URL}/teams/statistics?league=${leagueId}&season=${SEASON}&team=${teamId}`;
+// GET /matches/{matchId}/info
+async function getMatchInfo(matchId) {
+  const url = `${BASE_URL}/matches/${matchId}/info`;
   const data = await fetchJSON(url);
-  return data.response || null;
+  return data?.response?.items || data?.items || null;
 }
 
-// Fetch head-to-head between two teams (last 10 meetings)
-async function getH2H(homeId, awayId) {
-  const url = `${BASE_URL}/fixtures/headtohead?h2h=${homeId}-${awayId}&last=10`;
+// GET /matches/{matchId}/statsv2
+async function getMatchStats(matchId) {
+  const url = `${BASE_URL}/matches/${matchId}/statsv2`;
   const data = await fetchJSON(url);
-  return data.response || [];
+  return data?.response?.items || data?.items || null;
 }
 
-// Calculate attack/defence strength from team stats
-function calcStrengths(stats) {
-  if (!stats || !stats.goals) {
-    return { attack: 1.0, defence: 1.0, xG: 1.35 };
+// Calcular strengths desde statsv2
+function calcStrengths(stats, isHome) {
+  if (!stats) return { attack: 1.0, defence: 1.0 };
+  try {
+    const side = isHome ? stats.home : stats.away;
+    const goals = parseFloat(side?.goals?.total) || 1.35;
+    const conceded = parseFloat(side?.goals?.conceded) || 1.35;
+    const BASE = 1.35;
+    return {
+      attack: Math.max(goals / BASE, 0.3),
+      defence: Math.max(conceded / BASE, 0.3),
+      avgScored: goals,
+      avgConceded: conceded,
+    };
+  } catch {
+    return { attack: 1.0, defence: 1.0 };
   }
-
-  const played = stats.fixtures?.played?.total || 1;
-  const scored = stats.goals?.for?.total?.total || played;
-  const conceded = stats.goals?.against?.total?.total || played;
-
-  const BASE_AVG = 1.35;
-  const attack = (scored / played) / BASE_AVG;
-  const defence = (conceded / played) / BASE_AVG;
-
-  return {
-    attack: Math.max(attack, 0.3),
-    defence: Math.max(defence, 0.3),
-    avgScored: scored / played,
-    avgConceded: conceded / played,
-    played,
-  };
 }
 
-// Calculate expected goals for both teams using Dixon-Coles inputs
-function calcExpectedGoals(homeStats, awayStats) {
-  const BASE_AVG = 1.35;
-
-  const homeAttack = homeStats.attack;
-  const homeDefence = homeStats.defence;
-  const awayAttack = awayStats.attack;
-  const awayDefence = awayStats.defence;
-
-  // lambdaH = home attack × away defence × base avg
-  // lambdaA = away attack × home defence × base avg
-  // No home advantage for World Cup (neutral ground)
-  const lambdaH = homeAttack * awayDefence * BASE_AVG;
-  const lambdaA = awayAttack * homeDefence * BASE_AVG;
-
+function calcLambdas(homeStats, awayStats) {
+  const BASE = 1.35;
+  const lambdaH = homeStats.attack * awayStats.defence * BASE;
+  const lambdaA = awayStats.attack * homeStats.defence * BASE;
   return {
     lambdaH: Math.max(lambdaH, 0.2),
     lambdaA: Math.max(lambdaA, 0.2),
@@ -102,101 +82,79 @@ export default async function handler(req, res) {
     return res.status(500).json({ error: "API key not configured" });
   }
 
-  try {
-    // Try World Cup first, then fallback leagues
-    let fixtures = await getTodayFixtures(WC_LEAGUE_ID);
+  const dateStr = today();
 
-    // If no WC fixtures today, try major leagues
-    if (fixtures.length === 0) {
-      const fallbackLeagues = [2, 3, 39, 140, 135, 78, 61]; // Nations, Int friendlies, PL, LaLiga...
-      for (const lid of fallbackLeagues) {
-        const fb = await getTodayFixtures(lid);
-        fixtures = fixtures.concat(fb);
-        if (fixtures.length >= 5) break;
-      }
+  try {
+    // 1. Obtener lista de partidos del día
+    const matches = await getMatchesByDate(dateStr);
+
+    if (!matches || matches.length === 0) {
+      return res.status(200).json({ date: dateStr, fixtures: [], count: 0 });
     }
 
-    // Enrich each fixture with team stats + xG
+    // 2. Enriquecer hasta 8 partidos con stats
     const enriched = await Promise.allSettled(
-      fixtures.slice(0, 8).map(async (fixture) => {
-        const homeId = fixture.teams.home.id;
-        const awayId = fixture.teams.away.id;
-        const leagueId = fixture.league.id;
+      matches.slice(0, 8).map(async (match) => {
+        const matchId = match.id || match.match_id || match.pid;
+        if (!matchId) throw new Error("No match ID");
 
+        let stats = null;
         try {
-          const [homeStats, awayStats, h2h] = await Promise.allSettled([
-            getTeamStats(homeId, leagueId),
-            getTeamStats(awayId, leagueId),
-            getH2H(homeId, awayId),
-          ]);
+          stats = await getMatchStats(matchId);
+        } catch (_) {}
 
-          const hStats = calcStrengths(homeStats.value);
-          const aStats = calcStrengths(awayStats.value);
-          const { lambdaH, lambdaA } = calcExpectedGoals(hStats, aStats);
+        const homeTeam = match.home_team || match.homeTeam || match.home || {};
+        const awayTeam = match.away_team || match.awayTeam || match.away || {};
 
-          return {
-            id: fixture.fixture.id,
-            date: fixture.fixture.date,
-            status: fixture.fixture.status,
-            venue: fixture.fixture.venue?.name,
-            league: {
-              id: leagueId,
-              name: fixture.league.name,
-              logo: fixture.league.logo,
-              round: fixture.league.round,
-            },
-            home: {
-              id: homeId,
-              name: fixture.teams.home.name,
-              logo: fixture.teams.home.logo,
-              stats: hStats,
-            },
-            away: {
-              id: awayId,
-              name: fixture.teams.away.name,
-              logo: fixture.teams.away.logo,
-              stats: aStats,
-            },
-            score: fixture.goals,
-            lambdaH,
-            lambdaA,
-            h2h: (h2h.value || []).slice(0, 5).map((m) => ({
-              date: m.fixture.date,
-              homeTeam: m.teams.home.name,
-              awayTeam: m.teams.away.name,
-              homeGoals: m.goals.home,
-              awayGoals: m.goals.away,
-            })),
-          };
-        } catch (err) {
-          // Return fixture without enrichment if stats fail
-          return {
-            id: fixture.fixture.id,
-            date: fixture.fixture.date,
-            status: fixture.fixture.status,
-            league: { name: fixture.league.name, round: fixture.league.round },
-            home: { id: homeId, name: fixture.teams.home.name, logo: fixture.teams.home.logo, stats: { attack: 1.0, defence: 1.0 } },
-            away: { id: awayId, name: fixture.teams.away.name, logo: fixture.teams.away.logo, stats: { attack: 1.0, defence: 1.0 } },
-            score: fixture.goals,
-            lambdaH: 1.35,
-            lambdaA: 1.0,
-            h2h: [],
-          };
-        }
+        const homeStats = calcStrengths(stats, true);
+        const awayStats = calcStrengths(stats, false);
+        const { lambdaH, lambdaA } = calcLambdas(homeStats, awayStats);
+
+        return {
+          id: matchId,
+          date: match.date || match.match_date || dateStr,
+          status: match.status || match.match_status || "scheduled",
+          venue: match.venue || match.stadium || "",
+          league: {
+            name: match.competition?.name || match.league?.name || match.tournament || "Fútbol",
+            round: match.round || match.stage || "",
+          },
+          home: {
+            id: homeTeam.id || homeTeam.team_id || "",
+            name: homeTeam.name || homeTeam.team_name || "Local",
+            logo: homeTeam.logo || homeTeam.image || "",
+            stats: homeStats,
+          },
+          away: {
+            id: awayTeam.id || awayTeam.team_id || "",
+            name: awayTeam.name || awayTeam.team_name || "Visitante",
+            logo: awayTeam.logo || awayTeam.image || "",
+            stats: awayStats,
+          },
+          score: {
+            home: match.score?.home ?? match.home_score ?? null,
+            away: match.score?.away ?? match.away_score ?? null,
+          },
+          lambdaH,
+          lambdaA,
+          h2h: [],
+          rawMatch: match, // para debug
+        };
       })
     );
 
-    const results = enriched
+    const fixtures = enriched
       .filter((r) => r.status === "fulfilled")
       .map((r) => r.value);
 
     return res.status(200).json({
-      date: today(),
-      fixtures: results,
-      count: results.length,
+      date: dateStr,
+      fixtures,
+      count: fixtures.length,
     });
+
   } catch (err) {
-    console.error("Fixtures API error:", err);
+    console.error("Fixtures error:", err);
     return res.status(500).json({ error: err.message });
   }
 }
